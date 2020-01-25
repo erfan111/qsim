@@ -4,6 +4,9 @@ import argparse
 import heapq
 import math
 import random
+import multiprocessing as mp
+from itertools import product
+
 
 dists = {
     "exponential": stats.expon,
@@ -113,31 +116,41 @@ def simulate(s_dist: Distribution, rps, interval, n_cpus, max_cpus, iterations, 
     tail = np.percentile(latencies, [50,90, 95,99,99.9])/1000
     return ((sum(latencies)/1000)/len(latencies), *tail)
 
+def f(point, args):
+    load = (point / args.datapoints) * args.utilization
+    rps = (1e6 * load) / int(args.service_time_distribution[1])
+    latencies = []
+    optimal_cpus = 0.0
+    efficiency = 0.0
+    service_dist = Distribution(args.service_time_distribution[0])
+    service_dist.parse_args(args.service_time_distribution)
 
+    iarrival_dist = Distribution(args.interarrival_time_distribution[0])
+    iarrival_dist.parse_args(args.interarrival_time_distribution)
+    # for n_cpus in range(1, args.cpus+1):
+    #     tail = simulate(service_dist, rps, args.interval, n_cpus, args.max_cpus, args.iterations, iarrival_dist)
+    #     latencies.append(tail)
+    #     print("Tail = {}, cpus = {}, rps = {}".format(tail, n_cpus, rps))
+    #     if tail < args.sla:
+    #         optimal_cpus = n_cpus
+    #         efficiency = rps / optimal_cpus
+    #         break
+    avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, args.interval, args.cpus, args.max_cpus, args.iterations, iarrival_dist)
+    # print("{}, {}, {}, {}".format(load, rps, efficiency, optimal_cpus))  # todo: check the difference between rps vs load
+    print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, optimal_cpus))
+
+# TODO: implement optimal_core mode
+# TODO: parallel processing
 def initiate(args):
     print("Load, Requests/s, avg, p50, p90, p95, p99, p999, Cores")
-    for point in range(1, args.datapoints+1):
-        load = (point / args.datapoints) * args.utilization
-        rps = (1e6 * load) / int(args.service_time_distribution[1])
-        latencies = []
-        optimal_cpus = 0.0
-        efficiency = 0.0
-        service_dist = Distribution(args.service_time_distribution[0])
-        service_dist.parse_args(args.service_time_distribution)
+    N = mp.cpu_count()
+
+    with mp.Pool(processes = N) as p:
+        points = [(point, args) for point in range(1, args.datapoints+1)]
+        results = p.starmap(f, points)
+
     
-        iarrival_dist = Distribution(args.interarrival_time_distribution[0])
-        iarrival_dist.parse_args(args.interarrival_time_distribution)
-        # for n_cpus in range(1, args.cpus+1):
-        #     tail = simulate(service_dist, rps, args.interval, n_cpus, args.max_cpus, args.iterations, iarrival_dist)
-        #     latencies.append(tail)
-        #     print("Tail = {}, cpus = {}, rps = {}".format(tail, n_cpus, rps))
-        #     if tail < args.sla:
-        #         optimal_cpus = n_cpus
-        #         efficiency = rps / optimal_cpus
-        #         break
-        avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, args.interval, args.cpus, args.max_cpus, args.iterations, iarrival_dist)
-        # print("{}, {}, {}, {}".format(load, rps, efficiency, optimal_cpus))  # todo: check the difference between rps vs load
-        print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, optimal_cpus))  # todo: check the difference between rps vs load
+ 
 
 
 def arguments():
