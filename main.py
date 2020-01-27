@@ -90,7 +90,7 @@ def create_schedule(s_dist, rps, interval, i_dist):
     
     return reqs
 
-
+# Single queue - FIFO
 def simulate_schedule(schedule, interval, n_cpus, max_cpus):
     time = 0
     cpus = [0] * n_cpus
@@ -99,6 +99,8 @@ def simulate_schedule(schedule, interval, n_cpus, max_cpus):
     heapq.heapify(cpus)
     latencies = []
     for request in schedule:
+        if time > request.start:
+            print("no")
         time = max(time, request.start)
         time = max(time, heapq.heappop(cpus))
         latencies.append(time - request.start + request.service_time)
@@ -106,6 +108,56 @@ def simulate_schedule(schedule, interval, n_cpus, max_cpus):
     
     return latencies
 
+class Event:
+    def __init__(self, event_type, time, req):
+        self.type = event_type
+        self.time = time
+        self.request = req
+
+    def __gt__(self, e2):
+        return self.time > e2.time
+    
+    def __lt__(self, e2):
+        return self.time < e2.time
+
+    def __eq__(self, e2):
+        return self.time == e2.time
+    
+    def __ne__(self, e2):
+        return self.time != e2.time
+    
+    def __le__(self, e2):
+        return self.time <= e2.time
+
+    def __ge__(self, e2):
+        return self.time >= e2.time
+
+# Single queue - SJF
+def simulate_schedule_sjf(schedule, interval, n_cpus, max_cpus):
+    time = 0
+    cpus = [0] * n_cpus
+    for _ in range(n_cpus, max_cpus):
+        cpus.append(1e6 * interval)
+    heapq.heapify(cpus)
+
+    queue = []
+    events = []
+
+    latencies = []
+    for request in schedule:
+        heapq.heappush(events, Event('A', request.start, request))
+        free_cpu_time = cpus[0]
+        if(request.start < free_cpu_time):
+            # we have to queue the request
+            queue.append(request)
+        else:
+
+        time = max(time, request.start)
+        time = max(time, heapq.heappop(cpus))
+        latencies.append(time - request.start + request.service_time)
+        heapq.heappush(cpus, request.service_time + time)
+    
+    return latencies
 
 
 def simulate(s_dist: Distribution, rps, interval, n_cpus, max_cpus, iterations, i_dist: Distribution):
