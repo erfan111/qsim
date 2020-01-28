@@ -6,6 +6,7 @@ import math
 import random
 import multiprocessing as mp
 from itertools import product
+from operator import attrgetter
 
 
 dists = {
@@ -15,10 +16,23 @@ dists = {
     "gpareto": stats.genpareto
 }
 
+class Simulator:
+    def __init__(self, interval, n_cpus, max_cpus, iterations, discipline):
+        self.interval = interval
+        self.n_cpus = n_cpus
+        self.max_cpus = max_cpus
+        self.iterations = iterations
+        self.discipline = discipline
+
+
 class Request():
     def __init__(self, start, serv):
         self.start = start
         self.service_time = serv
+        self.queue_time = 0
+    
+    def __repr__(self):
+        return "[{}-{}]".format(self.start, self.service_time)
 
 
 class Distribution:
@@ -75,39 +89,6 @@ class Distribution:
         else:
             raise NotImplementedError
 
-def create_schedule(s_dist, rps, interval, i_dist):
-    ns_per_req = 1e9 / rps
-    n_reqs = int((interval * 1e9) // ns_per_req) + 1
-    i_dist.set_lambda(ns_per_req/1000)
-    # print(n_reqs)
-    reqs = []
-    last = 0
-    for _ in range(n_reqs):
-        last += (i_dist.sample() *1e3)
-        last = min([last, interval*1e9])
-        ss = s_dist.sample()* 1e3
-        reqs.append(Request(last,ss))
-    
-    return reqs
-
-# Single queue - FIFO
-def simulate_schedule(schedule, interval, n_cpus, max_cpus):
-    time = 0
-    cpus = [0] * n_cpus
-    for _ in range(n_cpus, max_cpus):
-        cpus.append(1e6 * interval)
-    heapq.heapify(cpus)
-    latencies = []
-    for request in schedule:
-        if time > request.start:
-            print("no")
-        time = max(time, request.start)
-        time = max(time, heapq.heappop(cpus))
-        latencies.append(time - request.start + request.service_time)
-        heapq.heappush(cpus, request.service_time + time)
-    
-    return latencies
-
 class Event:
     def __init__(self, event_type, time, req):
         self.type = event_type
@@ -132,39 +113,96 @@ class Event:
     def __ge__(self, e2):
         return self.time >= e2.time
 
-# Single queue - SJF
-def simulate_schedule_sjf(schedule, interval, n_cpus, max_cpus):
+
+def pop_shortest_job(queue):
+        sj = min(queue,key=attrgetter('service_time'))
+        # print(queue, len(queue), queue.index(sj), sj)
+        queue.remove(sj)
+        return sj
+
+def create_schedule(s_dist, rps, interval, i_dist):
+    ns_per_req = 1e9 / rps
+    n_reqs = int((interval * 1e9) // ns_per_req) + 1
+    i_dist.set_lambda(ns_per_req/1000)
+    # print(n_reqs)
+    reqs = []
+    last = 0
+    for _ in range(n_reqs):
+        last += (i_dist.sample() *1e3)
+        if last >= (interval*1e9):
+            break
+        last = min([last, interval*1e9])
+        ss = s_dist.sample()* 1e3
+        reqs.append(Request(last,ss))
+    
+    return reqs
+
+# Single queue - FIFO
+def simulate_schedule_fifo(schedule, interval, n_cpus, max_cpus):
     time = 0
     cpus = [0] * n_cpus
     for _ in range(n_cpus, max_cpus):
         cpus.append(1e6 * interval)
     heapq.heapify(cpus)
-
-    queue = []
-    events = []
-
     latencies = []
     for request in schedule:
-        heapq.heappush(events, Event('A', request.start, request))
-        free_cpu_time = cpus[0]
-        if(request.start < free_cpu_time):
-            # we have to queue the request
-            queue.append(request)
-        else:
-
         time = max(time, request.start)
         time = max(time, heapq.heappop(cpus))
         latencies.append(time - request.start + request.service_time)
         heapq.heappush(cpus, request.service_time + time)
     
+    # latencies.sort()
+    # print(latencies[-10:])
     return latencies
 
-
-def simulate(s_dist: Distribution, rps, interval, n_cpus, max_cpus, iterations, i_dist: Distribution):
+# Single queue - SJF
+def simulate_schedule_sjf(schedule, interval, n_cpus, max_cpus):
+    time = 0
+    idle_cpus = n_cpus
+    queue = []
+    events = []
     latencies = []
-    for _ in range(iterations):
-        schedule = create_schedule(s_dist, rps, interval, i_dist)
-        latencies += simulate_schedule(schedule, interval, n_cpus, max_cpus)
+    max_q = 0
+    for request in schedule:
+        heapq.heappush(events, Event('A', request.start, request))
+    while len(events) > 0:
+        event = heapq.heappop(events)
+        request = event.request
+        time = event.time
+        if event.type == 'A':
+            if idle_cpus > 0:  # a CPU is free
+                heapq.heappush(events, Event('D', request.start + request.service_time, request))
+                idle_cpus -= 1
+            else:
+                if(len(queue) > max_q):
+                    max_q = len(queue)
+                queue.append(event.request)
+        else:
+            latencies.append(request.service_time + request.queue_time)
+            if len(queue) > 0:
+                sj = pop_shortest_job(queue)
+                sj.queue_time = time - sj.start
+                heapq.heappush(events, Event('D', time + sj.service_time, sj))
+            else:
+                idle_cpus = min(idle_cpus+1, n_cpus)
+    
+    # latencies.sort()
+    # print(latencies[-10:], max_q)
+    return latencies
+
+def simulate_schedule(schedule, sim):
+    if sim.discipline == 'fifo':
+        return simulate_schedule_fifo(schedule, sim.interval, sim.n_cpus, sim.max_cpus)
+    elif sim.discipline == 'sjf':
+        return simulate_schedule_sjf(schedule, sim.interval, sim.n_cpus, sim.max_cpus)
+    else:
+        raise NotImplementedError("Queue discipline not implemented")
+
+def simulate(s_dist: Distribution, rps, sim, i_dist: Distribution):
+    latencies = []
+    for _ in range(sim.iterations):
+        schedule = create_schedule(s_dist, rps, sim.interval, i_dist)
+        latencies += simulate_schedule(schedule, sim)
     tail = np.percentile(latencies, [50,90, 95,99,99.9])/1000
     return ((sum(latencies)/1000)/len(latencies), *tail)
 
@@ -187,19 +225,21 @@ def f(point, args):
     #         optimal_cpus = n_cpus
     #         efficiency = rps / optimal_cpus
     #         break
-    avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, args.interval, args.cpus, args.max_cpus, args.iterations, iarrival_dist)
+    sim = Simulator(args.interval, args.cpus, int(args.max_cpus), args.iterations, args.discipline)
+    avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, sim, iarrival_dist)
     # print("{}, {}, {}, {}".format(load, rps, efficiency, optimal_cpus))  # todo: check the difference between rps vs load
     print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, optimal_cpus))
 
 # TODO: implement optimal_core mode
-# TODO: parallel processing
 def initiate(args):
     print("Load, Requests/s, avg, p50, p90, p95, p99, p999, Cores")
     N = mp.cpu_count()
 
     with mp.Pool(processes = N) as p:
         points = [(point, args) for point in range(1, args.datapoints+1)]
-        results = p.starmap(f, points)
+        p.starmap(f, points)
+    # for point in range(1, args.datapoints+1):
+    #     f(point, args)
 
     
  
@@ -209,7 +249,7 @@ def arguments():
     usg = '''
         main.py [-h] {optimal_cores,tail} [--datapoints DATAPOINTS] [--iterations ITERATIONS]
                [--cpus CPUS] [--max-cpus MAX_CPUS] [--interval INTERVAL]
-               [--utilization UTILIZATION] [--sla SLA]
+               [--utilization UTILIZATION] [--sla SLA] [--discipline {fifo|sjf}]
                [--service_time [SERVICE_TIME_DISTRIBUTION [Dist args ...]]]
                [--interarrival_time [INTERARRIVAL_TIME_DISTRIBUTION [Dist args ...]]]
 
@@ -220,27 +260,33 @@ def arguments():
             gpareto <scale> <c>
             uniform <a> <b>
             All distribution parameters should be in microseconds
+
+        Supported disciplines:
+            fifo
+            sjf
                
     '''
     parser = argparse.ArgumentParser(description='Queuing System Simulation Software', usage=usg)
     parser.add_argument('mode', choices=['optimal_cores', 'tail'], default='tail',
                         help='Number of rate points to simulate, default=10')
-    parser.add_argument('--datapoints', dest='datapoints', default=10,
+    parser.add_argument('--datapoints', dest='datapoints', default=10, type=int,
                         help='Number of rate points to simulate, default=10')
-    parser.add_argument('--iterations', dest='iterations', default=1,
+    parser.add_argument('--iterations', dest='iterations', default=1, type=int,
                         help='Number of simulation iterations, default=1')
     # parser.add_argument('--rps', dest='max_load', default=500000,
     #                     help='Maximum Request per second')
-    parser.add_argument('--cpus', dest='cpus', default=10,
+    parser.add_argument('--cpus', dest='cpus', default=10, type=int,
                         help='Starting number of CPUs to simulate, default=10')
-    parser.add_argument('--max-cpus', dest='max_cpus', default=16,
+    parser.add_argument('--max-cpus', dest='max_cpus', default=16, type=int,
                         help='Maximum number of CPUs to simulate, default=16')
-    parser.add_argument('--interval', dest='interval', default=1,
+    parser.add_argument('--interval', dest='interval', default=1, type=int,
                         help='Length of simulation interval in seconds, default=1s')
     parser.add_argument('--utilization', dest='utilization', default=8, type=int,
                         help='Number of processor to fully utilize, default=8')
-    parser.add_argument('--sla', dest='sla', default=200,
+    parser.add_argument('--sla', dest='sla', default=200, type=int,
                         help='Service Level Objective for p999 latency, default=200us')
+    parser.add_argument('--discipline', dest='discipline', default='fifo',
+                        help='Queuing discipline, default=fifo')
     parser.add_argument('--service_time', dest='service_time_distribution', nargs="*", default=["constant", 1],
                         help='Service-time distribution')
     parser.add_argument('--interarrival_time', dest='interarrival_time_distribution', nargs="*", default=["exponential", 10],
