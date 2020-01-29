@@ -130,3 +130,4 @@ dmypy.json
 
 .venv3/
 .vscode/
+local_results/

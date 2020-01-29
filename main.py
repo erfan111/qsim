@@ -17,12 +17,13 @@ dists = {
 }
 
 class Simulator:
-    def __init__(self, interval, n_cpus, max_cpus, iterations, discipline):
+    def __init__(self, interval, n_cpus, max_cpus, iterations, discipline, quanta_us=0):
         self.interval = interval
         self.n_cpus = n_cpus
         self.max_cpus = max_cpus
         self.iterations = iterations
         self.discipline = discipline
+        self.quanta_ns = 1000*quanta_us
 
 
 class Request():
@@ -30,6 +31,8 @@ class Request():
         self.start = start
         self.service_time = serv
         self.queue_time = 0
+        self.queue_start = 0
+        self.runtime = 0
     
     def __repr__(self):
         return "[{}-{}]".format(self.start, self.service_time)
@@ -44,9 +47,7 @@ class Distribution:
         if self.dist == "uniform":
             return dists[self.dist].rvs(loc=self.p["a"], scale=self.p["b"])
         elif self.dist == "exponential":
-            # return dists[self.dist].rvs((self.p["lambda"]))
             a = -math.log(1 - random.random()) / self.p["lambda"]
-            # print(a)
             return a * 1e6
         elif self.dist == "normal":
             return dists[self.dist].rvs(loc=self.p["mean"], scale=self.p["stddev"])
@@ -54,6 +55,13 @@ class Distribution:
             return self.p["value"]
         elif self.dist == "gpareto":
             return dists[self.dist].rvs(c=self.p["c"], scale=self.p["scale"])
+        elif self.dist == "lognormal":
+            return random.lognormvariate(self.p["mean"], self.p["stddev"])
+        elif self.dist == "bimodal":
+            if(random.randint(1, 100) < self.p["weight1"]):
+                return random.normalvariate(self.p["mean1"], 1)
+            else:
+                return random.normalvariate(self.p["mean2"], 1)
         else:
             raise NotImplementedError
     
@@ -71,6 +79,14 @@ class Distribution:
         elif self.dist == "gpareto":
             self.p["c"] = float(args[2])
             self.p["scale"] = float(args[1])
+        elif self.dist == "lognormal":
+            self.p["mean"] = float(args[1])
+            self.p["stddev"] = float(args[2])
+        elif self.dist == "bimodal":
+            self.p["mean1"] = float(args[1])
+            self.p["weight1"] = float(args[2])
+            self.p["mean2"] = float(args[3])
+            self.p["weight2"] = float(args[4])
         else:
             raise NotImplementedError
 
@@ -86,6 +102,8 @@ class Distribution:
             self.p["value"] = l
         elif self.dist == "gpareto":
             self.p["scale"] = l
+        elif self.dist == "lognormal":
+            self.p["mean"] = l
         else:
             raise NotImplementedError
 
@@ -116,8 +134,8 @@ class Event:
 
 def pop_shortest_job(queue):
         sj = min(queue,key=attrgetter('service_time'))
-        # print(queue, len(queue), queue.index(sj), sj)
         queue.remove(sj)
+        # sj = queue.pop(0)
         return sj
 
 def create_schedule(s_dist, rps, interval, i_dist):
@@ -190,11 +208,106 @@ def simulate_schedule_sjf(schedule, interval, n_cpus, max_cpus):
     # print(latencies[-10:], max_q)
     return latencies
 
+
+def simulate_schedule_ps(schedule, interval, n_cpus, max_cpus, quanta_ns):
+    time = 0
+    idle_cpus = n_cpus
+    queue = []
+    events = []
+    latencies = []
+    for request in schedule:
+        heapq.heappush(events, Event('A', request.start, request))
+    while len(events) > 0:
+        event = heapq.heappop(events)
+        request = event.request
+        time = event.time
+        if event.type == 'A':
+            if idle_cpus > 0:  # a CPU is free
+                if request.service_time > quanta_ns:
+                    heapq.heappush(events, Event('P', request.start + quanta_ns, request))
+                else:
+                    heapq.heappush(events, Event('D', request.start + request.service_time, request))
+                idle_cpus -= 1
+            else:
+                event.request.queue_start = time
+                queue.append(event.request)
+        elif event.type == 'D':
+            latencies.append(request.service_time + request.queue_time)
+            if len(queue) > 0:
+                sj = queue.pop(0)
+                sj.queue_time += (time - sj.queue_start)
+                if (request.service_time - request.runtime) > quanta_ns:
+                    heapq.heappush(events, Event('P', time + quanta_ns, sj))
+                else:
+                    heapq.heappush(events, Event('D', time + sj.service_time - sj.runtime, sj)) 
+            else:
+                idle_cpus = min(idle_cpus+1, n_cpus)
+        else:   # preemption event
+            request.queue_start = time
+            queue.append(request)
+            request.runtime += quanta_ns
+            sj = queue.pop(0)
+            sj.queue_time += (time - sj.queue_start)
+            if (request.service_time - request.runtime) > quanta_ns:
+                heapq.heappush(events, Event('P', time + quanta_ns, sj))
+            else:
+                heapq.heappush(events, Event('D', time + sj.service_time - sj.runtime, sj))
+    return latencies
+
+def simulate_schedule_psjf(schedule, interval, n_cpus, max_cpus, quanta_ns):
+    time = 0
+    idle_cpus = n_cpus
+    queue = []
+    events = []
+    latencies = []
+    for request in schedule:
+        heapq.heappush(events, Event('A', request.start, request))
+    while len(events) > 0:
+        event = heapq.heappop(events)
+        request = event.request
+        time = event.time
+        if event.type == 'A':
+            if idle_cpus > 0:  # a CPU is free
+                if request.service_time > quanta_ns:
+                    heapq.heappush(events, Event('P', request.start + quanta_ns, request))
+                else:
+                    heapq.heappush(events, Event('D', request.start + request.service_time, request))
+                idle_cpus -= 1
+            else:
+                event.request.queue_start = time
+                queue.append(event.request)
+        elif event.type == 'D':
+            latencies.append(request.service_time + request.queue_time)
+            if len(queue) > 0:
+                sj = pop_shortest_job(queue)
+                sj.queue_time += (time - sj.queue_start)
+                if (request.service_time - request.runtime) > quanta_ns:
+                    heapq.heappush(events, Event('P', time + quanta_ns, sj))
+                else:
+                    heapq.heappush(events, Event('D', time + sj.service_time - sj.runtime, sj)) 
+            else:
+                idle_cpus = min(idle_cpus+1, n_cpus)
+        else:   # preemption event
+            request.queue_start = time
+            queue.append(request)
+            request.runtime += quanta_ns
+            sj = pop_shortest_job(queue)
+            sj.queue_time += (time - sj.queue_start)
+            if (request.service_time - request.runtime) > quanta_ns:
+                heapq.heappush(events, Event('P', time + quanta_ns, sj))
+            else:
+                heapq.heappush(events, Event('D', time + sj.service_time - sj.runtime, sj))
+    return latencies
+
 def simulate_schedule(schedule, sim):
     if sim.discipline == 'fifo':
         return simulate_schedule_fifo(schedule, sim.interval, sim.n_cpus, sim.max_cpus)
     elif sim.discipline == 'sjf':
         return simulate_schedule_sjf(schedule, sim.interval, sim.n_cpus, sim.max_cpus)
+    elif sim.discipline == 'ps':
+        return simulate_schedule_ps(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns)
+    elif sim.discipline == 'psjf':
+        return simulate_schedule_psjf(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns)
     else:
         raise NotImplementedError("Queue discipline not implemented")
 
@@ -204,11 +317,15 @@ def simulate(s_dist: Distribution, rps, sim, i_dist: Distribution):
         schedule = create_schedule(s_dist, rps, sim.interval, i_dist)
         latencies += simulate_schedule(schedule, sim)
     tail = np.percentile(latencies, [50,90, 95,99,99.9])/1000
+    with open("latencies.csv", "w") as f:
+        for l in latencies:
+            f.write("{}\n".format(l))
+    # print(latencies)
     return ((sum(latencies)/1000)/len(latencies), *tail)
 
 def f(point, args):
     load = (point / args.datapoints) * args.utilization
-    rps = (1e6 * load) / int(args.service_time_distribution[1])
+    rps = (1e6 * load) / 10 #int(args.service_time_distribution[1])
     latencies = []
     optimal_cpus = 0.0
     efficiency = 0.0
@@ -225,7 +342,7 @@ def f(point, args):
     #         optimal_cpus = n_cpus
     #         efficiency = rps / optimal_cpus
     #         break
-    sim = Simulator(args.interval, args.cpus, int(args.max_cpus), args.iterations, args.discipline)
+    sim = Simulator(args.interval, args.cpus, int(args.max_cpus), args.iterations, args.discipline, quanta_us=args.quanta)
     avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, sim, iarrival_dist)
     # print("{}, {}, {}, {}".format(load, rps, efficiency, optimal_cpus))  # todo: check the difference between rps vs load
     print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, optimal_cpus))
@@ -236,7 +353,7 @@ def initiate(args):
     N = mp.cpu_count()
 
     with mp.Pool(processes = N) as p:
-        points = [(point, args) for point in range(1, args.datapoints+1)]
+        points = [(point, args) for point in [28]]# range(1, args.datapoints+1)]
         p.starmap(f, points)
     # for point in range(1, args.datapoints+1):
     #     f(point, args)
@@ -252,18 +369,23 @@ def arguments():
                [--utilization UTILIZATION] [--sla SLA] [--discipline {fifo|sjf}]
                [--service_time [SERVICE_TIME_DISTRIBUTION [Dist args ...]]]
                [--interarrival_time [INTERARRIVAL_TIME_DISTRIBUTION [Dist args ...]]]
+               [--quanta PS_QUANTA_US]
 
         Supported distributions are:
             constant <val>
             exponential <scale>
             normal <mean> <stddev>
+            lognormal <mean> <stddev>
             gpareto <scale> <c>
             uniform <a> <b>
+            bimodal <mean1> <percent1> <mean2> <percent2>
             All distribution parameters should be in microseconds
 
         Supported disciplines:
             fifo
             sjf
+            ps
+            psjf
                
     '''
     parser = argparse.ArgumentParser(description='Queuing System Simulation Software', usage=usg)
@@ -285,6 +407,8 @@ def arguments():
                         help='Number of processor to fully utilize, default=8')
     parser.add_argument('--sla', dest='sla', default=200, type=int,
                         help='Service Level Objective for p999 latency, default=200us')
+    parser.add_argument('--quanta', dest='quanta', default=5, type=float,
+                        help='Processor-sharing/PSJF time quanta in microseconds, default=5us')
     parser.add_argument('--discipline', dest='discipline', default='fifo',
                         help='Queuing discipline, default=fifo')
     parser.add_argument('--service_time', dest='service_time_distribution', nargs="*", default=["constant", 1],
