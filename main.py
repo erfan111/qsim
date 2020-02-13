@@ -42,13 +42,15 @@ class Request():
 class Accounting():
     def __init__(self, warmup, duration):
         self.warmup_ns = warmup*1000
-        self.duration_ns = duration*1e6
+        self.duration_ns = duration*1e9
         self.latencies = []
         self.late_reqs = 0
+        self.non_conserved = 0
 
     
     def add_latency(self, latency, start_time, current_time):
         if start_time > self.warmup_ns:
+            # print(start_time, current_time, self.duration_ns)
             if current_time < self.duration_ns:
                 self.latencies.append(latency)
             else:
@@ -168,6 +170,7 @@ def pop_shortest_job(queue):
         return sj
 
 def create_schedule(s_dist, rps, interval, i_dist):
+    # print("creating schedule")
     ns_per_req = 1e9 / rps
     n_reqs = int((interval * 1e9) // ns_per_req) + 1
     i_dist.set_lambda(ns_per_req/1000)
@@ -200,6 +203,7 @@ def simulate_schedule_fifo(schedule, interval, n_cpus, max_cpus, accounting):
 
 # Single queue - SJF
 def simulate_schedule_sjf(schedule, interval, n_cpus, max_cpus, accounting):
+    # print("simulating schedule")
     time = 0
     idle_cpus = n_cpus
     queue = []
@@ -274,6 +278,49 @@ def simulate_schedule_ps(schedule, interval, n_cpus, max_cpus, quanta_ns, accoun
             else:
                 heapq.heappush(events, Event('D', time + sj.service_time - sj.runtime, sj))
 
+
+def simulate_schedule_nwc(schedule, interval, n_cpus, max_cpus, quanta_ns, accounting):
+    # print("simulating schedule")
+    THRESHOLD = 4000
+    time = 0
+    idle_cpus = n_cpus
+    queue = []
+    events = []
+    max_q = 0
+    e_cnt = 0
+    for request in schedule:
+        heapq.heappush(events, Event('A', request.start, request))
+    while len(events) > 0:
+        e_cnt += 1
+        # if e_cnt%10000 == 0:
+        #     print("simulating event {} of {}".format(e_cnt, len(schedule)))
+        event = heapq.heappop(events)
+        request = event.request
+        time = event.time
+        if event.type == 'A':
+            if idle_cpus > 0:  # a CPU is free
+                heapq.heappush(events, Event('D', request.start + request.service_time, request))
+                idle_cpus -= 1
+            else:
+                if(len(queue) > max_q):
+                    max_q = len(queue)
+                queue.append(event.request)
+        else:
+            accounting.add_latency(request.service_time + request.queue_time, request.start, time)
+            if len(events) < 1:
+                return
+            if (events[0].type == 'A' and events[0].time - time < THRESHOLD) or len(queue) < 1:
+                if len(queue) > 0:
+                    accounting.non_conserved +=1
+                    # print("work not conserved! {} q = {}".format(work_not_conserved, len(queue)))
+                # print(events[0].time - time, len(queue))
+                idle_cpus = min(idle_cpus+1, n_cpus)
+            else:
+                sj = pop_shortest_job(queue)
+                sj.queue_time = time - sj.start
+                heapq.heappush(events, Event('D', time + sj.service_time, sj))
+                
+
 def simulate_schedule_psjf(schedule, interval, n_cpus, max_cpus, quanta_ns, accounting):
     time = 0
     idle_cpus = n_cpus
@@ -296,7 +343,6 @@ def simulate_schedule_psjf(schedule, interval, n_cpus, max_cpus, quanta_ns, acco
                 event.request.queue_start = time
                 queue.append(event.request)
         elif event.type == 'D':
-            # latencies.append(request.service_time + request.queue_time)
             accounting.add_latency(request.service_time + request.queue_time, request.start, time)
             if len(queue) > 0:
                 sj = pop_shortest_job(queue)
@@ -327,6 +373,8 @@ def simulate_schedule(schedule, sim, accounting):
         simulate_schedule_ps(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns, accounting)
     elif sim.discipline == 'psjf':
         simulate_schedule_psjf(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns, accounting)
+    elif sim.discipline == 'nwc':
+        simulate_schedule_nwc(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns, accounting)
     else:
         raise NotImplementedError("Queue discipline not implemented")
 
@@ -335,10 +383,11 @@ def simulate(s_dist: Distribution, rps, sim, i_dist: Distribution):
     for _ in range(sim.iterations):
         schedule = create_schedule(s_dist, rps, sim.interval, i_dist)
         simulate_schedule(schedule, sim, accounting)
+    # print("calculating percentiles")
     tail = accounting.get_percentiles_us([50,90, 95,99,99.9])
     if(sim.dump != ""):
         accounting.dump(sim.dump)
-    return (accounting.late_reqs, accounting.get_mean(), *tail)
+    return (accounting.non_conserved, accounting.late_reqs, accounting.get_mean(), *tail)
 
 def start_optimal_core_mode(args):
     optimal_cpus = 0.0
@@ -359,17 +408,22 @@ def start_optimal_core_mode(args):
 
 
 def f(point, args):
-    load = (point / args.datapoints) * args.utilization
-    rps = (1e6 * load) / args.mean_service_time
+    load = 0
+    rps = 0
+    if point == 0:
+        load = 1
+        rps = args.rps*1e6
+    else:
+        load = (point / args.datapoints) * args.utilization
+        rps = (1e6 * load) / args.mean_service_time
     service_dist = Distribution(args.service_time_distribution[0])
     service_dist.parse_args(args.service_time_distribution)
     iarrival_dist = Distribution(args.interarrival_time_distribution[0])
     iarrival_dist.parse_args(args.interarrival_time_distribution)
     sim = Simulator(args.interval, args.cpus, int(args.max_cpus), args.iterations, args.discipline, int(args.warmup), quanta_us=args.quanta, dump=args.dump)
-    late, avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, sim, iarrival_dist)
-    print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, late))
+    non_cnsrvd, late, avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, sim, iarrival_dist)
+    print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, late, non_cnsrvd))
 
-# TODO: implement optimal_core mode
 def initiate(args):
     
     N = mp.cpu_count()
@@ -377,9 +431,12 @@ def initiate(args):
         print("Load, Requests/s, avg, p50, p90, p95, p99, p999, Cores")
         start_optimal_core_mode(args)
     else:
-        with mp.Pool(processes = N) as p:
-            points = [(point, args) for point in range(1, args.datapoints+1)]
-            p.starmap(f, points)
+        if args.rps != 0:
+            f(0, args)
+        else:
+            with mp.Pool(processes = N) as p:
+                points = [(point, args) for point in range(1, args.datapoints+1)]
+                p.starmap(f, points)
         # for point in range(1, args.datapoints+1):
         #     f(point, args)
 
@@ -412,6 +469,7 @@ def arguments():
             sjf
             ps
             psjf
+            nwc (Non-work-conserving scheduler)
                
     '''
     parser = argparse.ArgumentParser(description='Queuing System Simulation Software', usage=usg)
@@ -437,8 +495,8 @@ def arguments():
                         help='Processor-sharing/PSJF time quanta in microseconds, default=5us')
     parser.add_argument('--warmup', dest='warmup', default=10, type=float,
                         help='The latency results for this duration will be ignored at the start of the experiments, default=10ms')
-    parser.add_argument('--rps', dest='rps', default=1.0, type=float,
-                        help='Used in optimal core mode to find the optimal number of core for that given rps, default=1MRPS')
+    parser.add_argument('--rps', dest='rps', default=0.0, type=float,
+                        help='Used in optimal core mode to find the optimal number of core for that given rps, default=0MRPS')
     parser.add_argument('--mean_service_time', dest='mean_service_time', default=10, type=float,
                         help='Mean service time is used to automatically determine the max load the system can tolerate, default=10us')
     parser.add_argument('--dump', dest='dump', default="", type=str,
