@@ -8,6 +8,7 @@ import multiprocessing as mp
 from itertools import product
 from operator import attrgetter
 
+MULTIPROCESSING_CPUS = mp.cpu_count()
 
 dists = {
     "exponential": stats.expon,
@@ -425,8 +426,6 @@ def f(point, args):
     print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, late, non_cnsrvd))
 
 def initiate(args):
-    
-    N = mp.cpu_count()
     if args.mode == "optimal_core":
         print("Load, Requests/s, avg, p50, p90, p95, p99, p999, Cores")
         start_optimal_core_mode(args)
@@ -434,7 +433,7 @@ def initiate(args):
         if args.rps != 0:
             f(0, args)
         else:
-            with mp.Pool(processes = N) as p:
+            with mp.Pool(processes = MULTIPROCESSING_CPUS) as p:
                 points = [(point, args) for point in range(1, args.datapoints+1)]
                 p.starmap(f, points)
         # for point in range(1, args.datapoints+1):
@@ -446,7 +445,7 @@ def initiate(args):
 
 def arguments():
     usg = '''
-        main.py [-h] {optimal_cores,tail} [--datapoints DATAPOINTS] [--iterations ITERATIONS]
+        simulator.py [-h] {optimal_cores,tail} [--datapoints DATAPOINTS] [--iterations ITERATIONS]
                [--cpus CPUS] [--max-cpus MAX_CPUS] [--interval INTERVAL]
                [--utilization UTILIZATION] [--sla SLA] [--discipline {fifo|sjf}]
                [--service_time [SERVICE_TIME_DISTRIBUTION [Dist args ...]]]
