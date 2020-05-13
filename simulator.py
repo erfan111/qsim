@@ -8,6 +8,8 @@ import multiprocessing as mp
 from itertools import product
 from operator import attrgetter
 
+from utils.util import *
+
 MULTIPROCESSING_CPUS = mp.cpu_count()
 
 dists = {
@@ -30,15 +32,16 @@ class Simulator:
 
 
 class Request():
-    def __init__(self, start, serv):
+    def __init__(self, start, serv, crit=True):
         self.start = start
         self.service_time = serv
         self.queue_time = 0
         self.queue_start = 0
         self.runtime = 0
+        self.critical = crit
     
     def __repr__(self):
-        return "[{}-{}]".format(self.start, self.service_time)
+        return "[{}-{}({})]".format(self.start, self.service_time, self.critical)
 
 class Accounting():
     def __init__(self, warmup, duration):
@@ -163,6 +166,12 @@ class Event:
     def __ge__(self, e2):
         return self.time >= e2.time
 
+class MQEvent(Event):
+    def __init__(self, event_type, time, req, task):
+        super().__init__(event_type, time, req)
+        self.cpu = 0
+        self.task = task
+
 
 def pop_shortest_job(queue):
         sj = min(queue,key=attrgetter('service_time'))
@@ -187,6 +196,341 @@ def create_schedule(s_dist, rps, interval, i_dist):
         reqs.append(Request(last,ss))
     
     return reqs
+
+def create_mq_schedule(s_dist, rps, interval, i_dist):
+    # print("creating schedule")
+    LC_TASK_RATIO = 80 # 80% mq tasks
+    ns_per_req = 1e9 / rps
+    n_reqs = int((interval * 1e9) // ns_per_req) + 1
+    i_dist.set_lambda(ns_per_req/1000)
+    # print(n_reqs)
+    reqs = []
+    last = 0
+    for _ in range(n_reqs):
+        last += (i_dist.sample() *1e3)
+        if last >= (interval*1e9):
+            break
+        last = min([last, interval*1e9])
+        ss = s_dist.sample()* 1e3
+        req = Request(last,ss)
+        if random.uniform(0,99) > LC_TASK_RATIO:
+            req.critical = False
+        reqs.append(req)
+    
+    return reqs
+
+###################################
+
+MQ_PERIOD = 40000
+MQ_RUNTIME = 20000
+
+class SchedEntity:
+    def __init__(self, request, start_time, service_time, mq_task):
+        self.request = request
+        self.start_time = start_time
+        self.service_time = service_time
+        self.queue_time = 0
+        self.cpu = 0
+        self.status = 1
+        self.mq_task = mq_task
+        self.sum_exec_runtime = 0
+        self.exec_start = 0
+        self.queue_start = 0
+
+class Processor:
+    def __init__(self, id):
+        self.id = id
+        self.queue = []
+        self.cfsrq = []
+        self.nr_running = 0
+        self.idle = True
+        self.time = 0
+        self.quanta_start = 0
+        self.curr = None
+        self.microq_time = 0
+        self.delta_exec_uncharged = 0
+        self.delta_exec_total = 0
+        self.microq_target_time = 0
+        self.microq_time = 0
+        self.throttled = False
+        self.cfs_nr_running = 0
+        self.hr_timer_active = False
+
+class EventManager:
+    def __init__(self):
+        self.queue = []
+        self.time = 0
+    
+    def add_event(self, event):
+        heapq.heappush(self.queue, event)
+
+    def pop_event(self):
+        e = heapq.heappop(self.queue)
+        self.time = e.time
+        return e
+    
+    def has_event(self):
+        return len(self.queue) > 0
+
+
+class SchedMQ:
+    def __init__(self, schedule, interval, n_cpus, max_cpus, accounting, evm):
+        self.schedule = schedule
+        self.interval = interval
+        self.n_cpus = n_cpus
+        self.max_cpus = max_cpus
+        self.accounting = accounting
+        self.period = MQ_PERIOD
+        self.runtime = MQ_RUNTIME
+        self.curr = None
+        self.event_manager = evm
+        self.processors = []
+        for i in range(n_cpus):
+            self.processors.append(Processor(i))
+
+    def account_bandwidth(self, cpu):
+        delta = self.processors[cpu].time - self.processors[cpu].quanta_start
+        self.processors[cpu].quanta_start += delta
+        if not self.processors[cpu].curr:
+            return
+        if self.processors[cpu].curr.mq_task:
+            self.processors[cpu].microq_time += delta
+            self.processors[cpu].delta_exec_uncharged += delta
+        self.processors[cpu].delta_exec_total += delta
+        self.processors[cpu].microq_target_time += (delta * (self.runtime/self.period))
+        self.processors[cpu].microq_time = clamp(self.processors[cpu].microq_time, u_saturation_sub(self.processors[cpu].microq_target_time, 2*self.period), self.processors[cpu].microq_target_time + (2*self.period))
+    ####
+
+    def enqueue_task(self, task, cpu):
+        self.account_bandwidth(cpu)
+        task.queue_start = self.processors[task.cpu].time
+        self.processors[task.cpu].queue.append(task)
+        self.processors[task.cpu].nr_running += 1
+        if not self.processors[task.cpu].curr:
+            self.resched_curr(cpu)
+
+    def enqueue_cfs_task(self, task, cpu):
+        task.queue_start = self.processors[task.cpu].time
+        self.processors[task.cpu].cfsrq.append(task)
+        self.processors[task.cpu].nr_running += 1
+        self.processors[task.cpu].cfs_nr_running += 1
+        if not self.processors[task.cpu].curr:
+            self.resched_curr(cpu)
+
+    def dequeue_task(self, task, cpu):
+        self.update_curr(cpu, task)
+        task.queue_time += (self.processors[task.cpu].time - task.queue_start)
+        self.processors[cpu].queue.remove(task)
+        self.processors[cpu].nr_running -= 1
+
+    def dequeue_cfs_task(self, task, cpu):
+        task.queue_time += (self.processors[task.cpu].time - task.queue_start)
+        self.processors[cpu].cfsrq.remove(task)
+        self.processors[cpu].nr_running -= 1
+        self.processors[cpu].cfs_nr_running -= 1
+
+    def requeue_task(self, task, cpu):
+        if task.mq_task:
+            self.processors[cpu].queue.append(self.processors[cpu].queue.pop(0))
+        else:
+            self.processors[cpu].cfsrq.append(self.processors[cpu].cfsrq.pop(0))
+        task.queue_start = self.processors[task.cpu].time
+
+
+    def yield_task(self, task, cpu):
+        self.requeue_task(task, cpu)
+
+    def timer_needed(self, cpu):
+        return self.processors[cpu].nr_running and self.processors[cpu].cfs_nr_running > 0
+    
+    def check_timer(self, cpu):
+        if self.processors[cpu].hr_timer_active:
+            return
+        self.account_bandwidth(cpu)
+        if self.processors[cpu].microq_time < self.processors[cpu].microq_target_time:
+		    self.processors[cpu].throttled = False
+		    expire = self.processors[cpu].microq_target_time - self.processors[cpu].microq_time
+		    expire = max(self.runtime, expire)
+        else:
+            self.processors[cpu].throttled = True
+            expire = self.processors[cpu].microq_time - self.processors[cpu].microq_target_time
+            expire = max(expire, self.period - self.runtime)
+        
+        self.processors[cpu].hr_timer_active = True
+        self.event_manager.add_event(MQEvent("T", expire*1000, None, None))
+
+    def pick_next_task(self, task, cpu):
+        if self.processors[cpu].nr_running == 0:
+            return None
+        if self.timer_needed(cpu):
+            self.check_timer(cpu)
+            if self.processors[cpu].throttled:
+                return None
+        else:
+            self.processors[cpu].throttled = False
+
+        self.put_prev_task(task, cpu)
+        next_task = self.processors[cpu].queue[0]
+        return next_task
+
+    def put_prev_task(self, task, cpu):
+        pass
+        # if self.processors[cpu].delta_exec_uncharged * self.period > self.processors[cpu].delta_exec_total * self.runtime:
+        #      contrib_ratio = runtime * (1 << 10)/ period
+        # else:
+        #     contrib_ratio = (1 << 10)
+        # update rt load avg ratio
+
+    def find_rq(self, task, cpu):
+        low_prio_cpu = -1
+        low_nmicroq = self.processors[task.cpu].nr_running - self.processors[task.cpu].cfs_nr_running
+        low_nmicroq_cpu = -1
+        for c in range(task.cpu, self.n_cpus):
+            if self.processors[c].nr_running == 0:
+                return c
+        for c in range(0, task.cpu):
+            if self.processors[c].nr_running == 0:
+                return c
+        for c in range(0, self.n_cpus):
+            if self.processors[c].nr_running == self.processors[c].cfs_nr_running:
+                low_prio_cpu = c
+            elif (self.processors[c].nr_running - self.processors[c].cfs_nr_running + 1 < low_nmicroq):
+                low_nmicroq_cpu = c
+                low_nmicroq = self.processors[c].nr_running - self.processors[c].cfs_nr_running
+        if low_prio_cpu != -1:
+            return low_prio_cpu
+        return low_nmicroq_cpu
+
+    def find_cfs_rq(self, task, cpu):
+        low_ncfs = self.processors[task.cpu].cfs_nr_running
+        low_ncfs_cpu = task.cpu
+        for c in range(0, self.n_cpus):
+            if self.processors[c].nr_running == 0:
+                return c
+        for c in range(0, self.n_cpus):
+            if self.processors[c].cfs_nr_running < low_ncfs:
+                low_ncfs_cpu = c
+                low_ncfs = self.processors[c].nr_running - self.processors[c].cfs_nr_running
+        return low_ncfs_cpu
+
+    def select_task_rq(self, task, cpu):
+        if self.processors[cpu].nr_running > 0:
+            target = self.find_rq(task, cpu)
+            if target != -1:
+                task.cpu = target
+
+    def select_cfs_task_rq(self, task, cpu):
+        if self.processors[cpu].nr_running > 0:
+            target = self.find_cfs_rq(task, cpu)
+            if target != -1:
+                task.cpu = target
+
+    def push_microq_task(self, cpu):
+        return 0
+
+    def task_woken(self, task, cpu):
+        if self.processors[cpu].nr_running - self.processors[cpu].cfs_nr_running > 0:
+            while self.push_microq_task(cpu):
+                pass
+
+    def task_tick(self):
+        pass
+
+    def resched_curr(self, cpu):
+        current_task = self.processors[cpu].curr
+        if current_task:
+            if current_task.sum_exec_runtime - current_task.service_time <= 0:  # task is finished!
+                current_task.queue_start = self.event_manager.time
+                current_task.status = 0 # Finished
+                if current_task.mq_task:
+                    self.dequeue_task(current_task, cpu)
+                else:
+                    self.dequeue_cfs_task(current_task, cpu)
+                self.processors[cpu].curr = None
+            else:
+                self.requeue_task(current_task, cpu)
+        next_task = self.pick_next_task(current_task, cpu)
+        if next_task:
+            # print("context switching")
+            self.processors[cpu].curr = next_task
+            next_task.queue_time += (self.processors[next_task.cpu].time - next_task.queue_start)
+            self.event_manager.add_event(MQEvent("D", self.event_manager.time + next_task.service_time, None, next_task))
+        else:
+            cfs_task = self.pick_next_task_cfs(current_task, cpu)
+            if cfs_task:
+            # print("context switching")
+                self.processors[cpu].curr = cfs_task
+                next_task.queue_time += (self.processors[cfs_task.cpu].time - next_task.queue_start)
+                self.event_manager.add_event(MQEvent("D", self.event_manager.time + cfs_task.service_time, None, cfs_task))
+
+    def mq_period_timer(self, cpu, task):
+        nextslice = self.period
+        self.processors[cpu].hr_timer_active = False
+        self.account_bandwidth(cpu)
+        if self.timer_needed(cpu):
+            if self.processors[cpu].throttled:
+               self.processors[cpu].throttled = False
+               ns = u_saturation_sub(self.processors[cpu].microq_target_time, self.processors[cpu].microq_time)
+               nextslice = max(ns, self.runtime)
+            else:
+                self.processors[cpu].throttled = True
+                ns = u_saturation_sub(self.processors[cpu].microq_time, self.processors[cpu].microq_target_time)
+                ns = ns*self.period/self.runtime
+                ns = clamp(ns, u_saturation_sub(self.period, self.runtime), u_saturation_sub(self.period, self.runtime/2))
+            self.resched_curr(cpu)
+            self.processors[cpu].hr_timer_active = True
+            self.event_manager.add_event(MQEvent("T", self.event_manager.time + nextslice, None, task))
+        else:
+            self.processors[cpu].throttled = False
+
+    def update_curr(self, cpu, curr):
+        if not curr.mq_task:
+            return
+        self.account_bandwidth(cpu)
+        curr.sum_exec_runtime += self.processors[cpu].delta_exec_uncharged
+        curr.exec_start = self.processors[cpu].time
+         # update rt load avg ratio
+        self.processors[cpu].delta_exec_uncharged = 0
+        self.processors[cpu].delta_exec_total = 0
+
+
+
+
+def simulate_sched_microquanta(schedule, interval, n_cpus, max_cpus, accounting):
+    time = 0
+    events = EventManager()
+    mq = SchedMQ(schedule, interval, n_cpus, max_cpus, accounting, events)
+    for request in schedule:
+        t = SchedEntity(request, request.start, request.service_time, request.critical)
+        e = MQEvent('A', request.start, request, t)
+        # mq.select_task_rq(t, 0)
+        events.add_event(e)
+    while events.has_event():
+        event = events.pop_event()
+        request = event.request
+        time = event.time
+        task = event.task
+        mq.processors[task.cpu].time = time
+        if event.type == 'A':
+            if event.task.mq_task:
+                mq.select_task_rq(event.task, 0)
+                mq.enqueue_task(task, task.cpu)
+            else:
+                mq.select_cfs_task_rq(event.task, 0)
+                mq.enqueue_cfs_task(task, task.cpu)
+        elif event.type == 'D':
+            if event.task.status == 1:
+                mq.resched_curr(task.cpu)
+                # print(task.sum_exec_runtime, task.queue_time)
+                if task.mq_task:
+                    accounting.add_latency(task.service_time + task.queue_time, task.start_time, time)
+        elif event.type == 'T':
+            mq.mq_period_timer(task.cpu, task)
+        else:
+            print("WTF!")
+
+
+###################################
 
 # Single queue - FIFO
 def simulate_schedule_fifo(schedule, interval, n_cpus, max_cpus, accounting):
@@ -382,8 +726,12 @@ def simulate_schedule(schedule, sim, accounting):
 def simulate(s_dist: Distribution, rps, sim, i_dist: Distribution):
     accounting = Accounting(sim.warmup, sim.interval)
     for _ in range(sim.iterations):
-        schedule = create_schedule(s_dist, rps, sim.interval, i_dist)
-        simulate_schedule(schedule, sim, accounting)
+        if sim.discipline == 'mq':
+            schedule = create_mq_schedule(s_dist, rps, sim.interval, i_dist)
+            simulate_sched_microquanta(schedule, sim.interval, sim.n_cpus, sim.max_cpus, accounting)
+        else:
+            schedule = create_schedule(s_dist, rps, sim.interval, i_dist)
+            simulate_schedule(schedule, sim, accounting)
     # print("calculating percentiles")
     tail = accounting.get_percentiles_us([50,90, 95,99,99.9])
     if(sim.dump != ""):
