@@ -19,6 +19,7 @@ dists = {
     "gpareto": stats.genpareto
 }
 
+
 class Simulator:
     def __init__(self, interval, n_cpus, max_cpus, iterations, discipline, warmup, quanta_us=0, dump=""):
         self.interval = interval
@@ -167,10 +168,10 @@ class Event:
         return self.time >= e2.time
 
 class MQEvent(Event):
-    def __init__(self, event_type, time, req, task):
+    def __init__(self, event_type, time, req, task, cpu=-1):
         super().__init__(event_type, time, req)
-        self.cpu = 0
         self.task = task
+        self.cpu = cpu
 
 
 def pop_shortest_job(queue):
@@ -199,7 +200,9 @@ def create_schedule(s_dist, rps, interval, i_dist):
 
 def create_mq_schedule(s_dist, rps, interval, i_dist):
     # print("creating schedule")
-    LC_TASK_RATIO = 80 # 80% mq tasks
+    #######################################
+    LC_TASK_RATIO = 100 # 80% mq tasks    #
+    #######################################
     ns_per_req = 1e9 / rps
     n_reqs = int((interval * 1e9) // ns_per_req) + 1
     i_dist.set_lambda(ns_per_req/1000)
@@ -222,7 +225,7 @@ def create_mq_schedule(s_dist, rps, interval, i_dist):
 ###################################
 
 MQ_PERIOD = 40000
-MQ_RUNTIME = 20000
+MQ_RUNTIME = 30000
 
 class SchedEntity:
     def __init__(self, request, start_time, service_time, mq_task):
@@ -285,11 +288,13 @@ class SchedMQ:
         self.curr = None
         self.event_manager = evm
         self.processors = []
+        self.cfs_q = 0
+        self.mq_q = 0
         for i in range(n_cpus):
             self.processors.append(Processor(i))
 
     def account_bandwidth(self, cpu):
-        delta = self.processors[cpu].time - self.processors[cpu].quanta_start
+        delta = self.event_manager.time - self.processors[cpu].quanta_start
         self.processors[cpu].quanta_start += delta
         if not self.processors[cpu].curr:
             return
@@ -348,19 +353,19 @@ class SchedMQ:
             return
         self.account_bandwidth(cpu)
         if self.processors[cpu].microq_time < self.processors[cpu].microq_target_time:
-		    self.processors[cpu].throttled = False
-		    expire = self.processors[cpu].microq_target_time - self.processors[cpu].microq_time
-		    expire = max(self.runtime, expire)
+            self.processors[cpu].throttled = False
+            expire = self.processors[cpu].microq_target_time - self.processors[cpu].microq_time
+            expire = max(self.runtime, expire)
         else:
             self.processors[cpu].throttled = True
             expire = self.processors[cpu].microq_time - self.processors[cpu].microq_target_time
             expire = max(expire, self.period - self.runtime)
         
         self.processors[cpu].hr_timer_active = True
-        self.event_manager.add_event(MQEvent("T", expire*1000, None, None))
+        self.event_manager.add_event(MQEvent("T", self.event_manager.time + expire, None, None, cpu))
 
     def pick_next_task(self, task, cpu):
-        if self.processors[cpu].nr_running == 0:
+        if self.processors[cpu].nr_running - self.processors[cpu].cfs_nr_running == 0:
             return None
         if self.timer_needed(cpu):
             self.check_timer(cpu)
@@ -371,6 +376,12 @@ class SchedMQ:
 
         self.put_prev_task(task, cpu)
         next_task = self.processors[cpu].queue[0]
+        return next_task
+
+    def pick_next_task_cfs(self, task, cpu):
+        if self.processors[cpu].cfs_nr_running == 0:
+            return None
+        next_task = self.processors[cpu].cfsrq[0]
         return next_task
 
     def put_prev_task(self, task, cpu):
@@ -439,12 +450,22 @@ class SchedMQ:
     def resched_curr(self, cpu):
         current_task = self.processors[cpu].curr
         if current_task:
-            if current_task.sum_exec_runtime - current_task.service_time <= 0:  # task is finished!
+            current_task.sum_exec_runtime += (self.event_manager.time - current_task.exec_start)
+            sum_runtime = current_task.sum_exec_runtime
+            if abs(sum_runtime - current_task.service_time) <= 1:
+                # if sum_runtime - current_task.service_time >= 1:
+                #     print(sum_runtime - current_task.service_time)
+            # if abs(sum_runtime - current_task.service_time) <= 1:  # task is finished!
                 current_task.queue_start = self.event_manager.time
                 current_task.status = 0 # Finished
+                # print("start={},service={},runtime={},queue={},mq={}, nr_running={}, cfs_nr={}".format(int(current_task.start_time), int(current_task.service_time), int(current_task.sum_exec_runtime), current_task.queue_time, current_task.mq_task, self.processors[0].nr_running, self.processors[0].cfs_nr_running))
                 if current_task.mq_task:
+                    self.mq_q += current_task.queue_time
                     self.dequeue_task(current_task, cpu)
+                    self.accounting.add_latency(current_task.service_time + current_task.queue_time, current_task.start_time, self.event_manager.time)
+
                 else:
+                    self.cfs_q += current_task.queue_time
                     self.dequeue_cfs_task(current_task, cpu)
                 self.processors[cpu].curr = None
             else:
@@ -454,16 +475,18 @@ class SchedMQ:
             # print("context switching")
             self.processors[cpu].curr = next_task
             next_task.queue_time += (self.processors[next_task.cpu].time - next_task.queue_start)
-            self.event_manager.add_event(MQEvent("D", self.event_manager.time + next_task.service_time, None, next_task))
+            next_task.exec_start = self.event_manager.time
+            self.event_manager.add_event(MQEvent("D", self.event_manager.time + next_task.service_time - next_task.sum_exec_runtime, None, next_task))
         else:
             cfs_task = self.pick_next_task_cfs(current_task, cpu)
             if cfs_task:
             # print("context switching")
                 self.processors[cpu].curr = cfs_task
-                next_task.queue_time += (self.processors[cfs_task.cpu].time - next_task.queue_start)
-                self.event_manager.add_event(MQEvent("D", self.event_manager.time + cfs_task.service_time, None, cfs_task))
+                cfs_task.queue_time += (self.processors[cfs_task.cpu].time - cfs_task.queue_start)
+                cfs_task.exec_start = self.event_manager.time
+                self.event_manager.add_event(MQEvent("D", self.event_manager.time + cfs_task.service_time - cfs_task.sum_exec_runtime, None, cfs_task))
 
-    def mq_period_timer(self, cpu, task):
+    def mq_period_timer(self, cpu):
         nextslice = self.period
         self.processors[cpu].hr_timer_active = False
         self.account_bandwidth(cpu)
@@ -477,9 +500,10 @@ class SchedMQ:
                 ns = u_saturation_sub(self.processors[cpu].microq_time, self.processors[cpu].microq_target_time)
                 ns = ns*self.period/self.runtime
                 ns = clamp(ns, u_saturation_sub(self.period, self.runtime), u_saturation_sub(self.period, self.runtime/2))
-            self.resched_curr(cpu)
+                nextslice = ns
             self.processors[cpu].hr_timer_active = True
-            self.event_manager.add_event(MQEvent("T", self.event_manager.time + nextslice, None, task))
+            self.event_manager.add_event(MQEvent("T", self.event_manager.time + nextslice, None, None, cpu))
+            self.resched_curr(cpu)
         else:
             self.processors[cpu].throttled = False
 
@@ -487,8 +511,8 @@ class SchedMQ:
         if not curr.mq_task:
             return
         self.account_bandwidth(cpu)
-        curr.sum_exec_runtime += self.processors[cpu].delta_exec_uncharged
-        curr.exec_start = self.processors[cpu].time
+        # curr.sum_exec_runtime += self.processors[cpu].delta_exec_uncharged
+        # curr.exec_start = self.processors[cpu].time
          # update rt load avg ratio
         self.processors[cpu].delta_exec_uncharged = 0
         self.processors[cpu].delta_exec_total = 0
@@ -510,24 +534,31 @@ def simulate_sched_microquanta(schedule, interval, n_cpus, max_cpus, accounting)
         request = event.request
         time = event.time
         task = event.task
-        mq.processors[task.cpu].time = time
+        if task:
+            mq.processors[task.cpu].time = time
+        else:
+            mq.processors[event.cpu].time = time
         if event.type == 'A':
             if event.task.mq_task:
                 mq.select_task_rq(event.task, 0)
                 mq.enqueue_task(task, task.cpu)
+                if not mq.processors[task.cpu].curr.mq_task:
+                    mq.resched_curr(task.cpu)
             else:
                 mq.select_cfs_task_rq(event.task, 0)
                 mq.enqueue_cfs_task(task, task.cpu)
         elif event.type == 'D':
+            if task != mq.processors[task.cpu].curr:
+                continue
             if event.task.status == 1:
                 mq.resched_curr(task.cpu)
                 # print(task.sum_exec_runtime, task.queue_time)
-                if task.mq_task:
-                    accounting.add_latency(task.service_time + task.queue_time, task.start_time, time)
+                # if task.mq_task:
+                #     accounting.add_latency(task.service_time + task.queue_time, task.start_time, time)
         elif event.type == 'T':
-            mq.mq_period_timer(task.cpu, task)
-        else:
-            print("WTF!")
+            mq.mq_period_timer(event.cpu)
+    print(mq.cfs_q)
+    print(mq.mq_q)
 
 
 ###################################
@@ -773,6 +804,7 @@ def f(point, args):
     non_cnsrvd, late, avg, p50, p90, p95, p99, p999 = simulate(service_dist, rps, sim, iarrival_dist)
     print("{:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f},{:.2f},{:.2f},{:.2f}, {}, {}".format(load, rps, avg, p50, p90, p95, p99, p999, late, non_cnsrvd))
 
+
 def initiate(args):
     if args.mode == "optimal_core":
         print("Load, Requests/s, avg, p50, p90, p95, p99, p999, Cores")
@@ -826,8 +858,6 @@ def arguments():
                         help='Number of rate points to simulate, default=10')
     parser.add_argument('--iterations', dest='iterations', default=1, type=int,
                         help='Number of simulation iterations, default=1')
-    # parser.add_argument('--rps', dest='max_load', default=500000,
-    #                     help='Maximum Request per second')
     parser.add_argument('--cpus', dest='cpus', default=10, type=int,
                         help='Starting number of CPUs to simulate, default=10')
     parser.add_argument('--max-cpus', dest='max_cpus', default=16, type=int,
@@ -844,7 +874,7 @@ def arguments():
                         help='The latency results for this duration will be ignored at the start of the experiments, default=10ms')
     parser.add_argument('--rps', dest='rps', default=0.0, type=float,
                         help='Used in optimal core mode to find the optimal number of core for that given rps, default=0MRPS')
-    parser.add_argument('--mean_service_time', dest='mean_service_time', default=10, type=float,
+    parser.add_argument('--mean-service-time', dest='mean_service_time', default=10, type=float,
                         help='Mean service time is used to automatically determine the max load the system can tolerate, default=10us')
     parser.add_argument('--dump', dest='dump', default="", type=str,
                         help='You can specify a file for the simulator to dump all the request latencies')
