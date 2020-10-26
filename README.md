@@ -15,7 +15,7 @@ The simulator uses multiprocessing to speed up the simulation, however that mean
                [--service_time [SERVICE_TIME_DISTRIBUTION [Dist args ...]]]
                [--interarrival_time [INTERARRIVAL_TIME_DISTRIBUTION [Dist args ...]]]
                [--quanta PS_QUANTA_US] [--warmup WARMUP_MS] [--dump DUMPFILE]
-               [--rps MRPS]
+               [--rps MRPS] [--mean-service-time MST]
 
         Supported distributions are:
             constant <val>
@@ -52,7 +52,7 @@ optional arguments:
   --quanta QUANTA       Processor-sharing/PSJF time quanta in microseconds, default=5us
   --warmup WARMUP       The latency results for this duration will be ignored at the start of the experiments, default=10ms
   --rps RPS             Used in optimal core mode to find the optimal number of core for that given rps, default=0MRPS
-  --mean_service_time MEAN_SERVICE_TIME
+  --mean-service-time   MEAN_SERVICE_TIME
                         Mean service time is used to automatically determine the max load the system can tolerate, default=10us
   --dump DUMP           You can specify a file for the simulator to dump all the request latencies
   --discipline DISC     Queuing discipline, default=fifo
@@ -62,9 +62,9 @@ optional arguments:
 The only positional argument is `mode`. Select between `optimal_cores,tail`. The `tail` mode reports the latency percentiles for the given rates. The `optimal_cores` mode tries to find the optimal number of servers (cores) for a given rate and SLA combination.
 
 ## Example
-`$ python3 main.py tail --interarrival_time exponential 200  --service_time exponential 10 --utilization 16 --discipline sjf --max-cpus 16 --datapoints 30 --cpus 16`
+`$ python3 main.py tail --interarrival_time exponential 200  --service_time exponential 10 --utilization 16 --discipline sjf --max-cpus 16 --datapoints 30 --cpus 16 --mean-service-time 10`
 
-Simulates a queuing system with 16 servers, single queue with SJF scheduling the arrivals are exponentially distributed with lambda of 200 microseconds and service times have a lambda of 10microseconds. The simulation will try 30 different rates from near zero to the point where system utilization becomes 1.
+Simulates a queuing system with 16 servers, single queue with SJF scheduling the arrivals are exponentially distributed with lambda of 200us and service times have a lambda of 10us. The simulation will try 30 different rates from near zero to the point where system utilization becomes 1. You must specify the mean service time parameter explicitly to allow the proper definitions of data points for interarrival times.
 
 The result will be something like this:
 

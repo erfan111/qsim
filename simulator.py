@@ -233,6 +233,42 @@ def simulate_schedule_sjf(schedule, interval, n_cpus, max_cpus, accounting):
             else:
                 idle_cpus = min(idle_cpus+1, n_cpus)
     
+# Priority queue - PQ
+# def simulate_schedule_pq(schedule, interval, n_cpus, max_cpus, accounting):
+#     # print("simulating schedule")
+#     time = 0
+#     idle_cpus = n_cpus
+#     queue1 = []
+#     queue2 = []
+#     events = []
+#     max_q = 0
+#     for request in schedule:
+#         heapq.heappush(events, Event('A', request.start, request))
+#     while len(events) > 0:
+#         event = heapq.heappop(events)
+#         request = event.request
+#         time = event.time
+#         if event.type == 'A':
+#             if idle_cpus > 0:  # a CPU is free
+#                 heapq.heappush(events, Event('D', request.start + request.service_time, request))
+#                 idle_cpus -= 1
+#             else:
+#                 if event.request.high_prio:
+#                     queue1.append(event.request)
+#                 else:
+#                     queue2.append(event.request)
+#         else:
+#             accounting.add_latency(request.service_time + request.queue_time, request.start, time)
+#             if len(queue1) > 0:
+#                 sj = queue1.pop()
+#                 sj.queue_time = time - sj.start
+#                 heapq.heappush(events, Event('D', time + sj.service_time, sj))
+#             elif len(queue1) > 0:
+#                 sj = queue1.pop()
+#                 sj.queue_time = time - sj.start
+#                 heapq.heappush(events, Event('D', time + sj.service_time, sj))
+#             else:
+#                 idle_cpus = min(idle_cpus+1, n_cpus)
 
 
 def simulate_schedule_ps(schedule, interval, n_cpus, max_cpus, quanta_ns, accounting):
@@ -430,6 +466,7 @@ def initiate(args):
         print("Load, Requests/s, avg, p50, p90, p95, p99, p999, Cores")
         start_optimal_core_mode(args)
     else:
+        print("Load, Requests/s, avg, p50, p90, p95, p99, p999, Outstanding reqs, Cores")
         if args.rps != 0:
             f(0, args)
         else:
@@ -493,10 +530,10 @@ def arguments():
     parser.add_argument('--quanta', dest='quanta', default=5, type=float,
                         help='Processor-sharing/PSJF time quanta in microseconds, default=5us')
     parser.add_argument('--warmup', dest='warmup', default=10, type=float,
-                        help='The latency results for this duration will be ignored at the start of the experiments, default=10ms')
+                        help='The latency results for this duration will be ignored at the start of the experiments, default=10us')
     parser.add_argument('--rps', dest='rps', default=0.0, type=float,
                         help='Used in optimal core mode to find the optimal number of core for that given rps, default=0MRPS')
-    parser.add_argument('--mean_service_time', dest='mean_service_time', default=10, type=float,
+    parser.add_argument('--mean-service-time', dest='mean_service_time', default=10, type=float,
                         help='Mean service time is used to automatically determine the max load the system can tolerate, default=10us')
     parser.add_argument('--dump', dest='dump', default="", type=str,
                         help='You can specify a file for the simulator to dump all the request latencies')
