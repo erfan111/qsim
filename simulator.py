@@ -37,6 +37,24 @@ class Request():
         self.queue_start = 0
         self.runtime = 0
     
+    def __gt__(self, e2):
+        return self.service_time > e2.service_time
+    
+    def __lt__(self, e2):
+        return self.service_time < e2.service_time
+
+    def __eq__(self, e2):
+        return self.service_time == e2.service_time
+    
+    def __ne__(self, e2):
+        return self.service_time != e2.service_time
+    
+    def __le__(self, e2):
+        return self.service_time <= e2.service_time
+
+    def __ge__(self, e2):
+        return self.service_time >= e2.service_time
+    
     def __repr__(self):
         return "[{}-{}]".format(self.start, self.service_time)
 
@@ -74,6 +92,7 @@ class Distribution:
     def __init__(self, name):
         self.p = {}
         self.dist = name
+        self.trace = []
     
     def sample(self):
         if self.dist == "uniform":
@@ -94,6 +113,8 @@ class Distribution:
                 return random.normalvariate(self.p["mean1"], 1)
             else:
                 return random.normalvariate(self.p["mean2"], 1)
+        elif self.dist == "trace":
+                return random.choice(self.trace)
         else:
             raise NotImplementedError
     
@@ -119,6 +140,10 @@ class Distribution:
             self.p["weight1"] = float(args[2])
             self.p["mean2"] = float(args[3])
             self.p["weight2"] = float(args[4])
+        elif self.dist == "trace":
+            with open(args[1]) as f:
+                for i in f.readlines():
+                    self.trace.append(float(i.strip())/1000)
         else:
             raise NotImplementedError
 
@@ -170,12 +195,16 @@ def pop_shortest_job(queue):
         # sj = queue.pop(0)
         return sj
 
+def pop_least_attained_service_job(queue):
+        las = min(queue,key=attrgetter('runtime'))
+        queue.remove(las)
+        return las
+
 def create_schedule(s_dist, rps, interval, i_dist):
     # print("creating schedule")
     ns_per_req = 1e9 / rps
     n_reqs = int((interval * 1e9) // ns_per_req) + 1
     i_dist.set_lambda(ns_per_req/1000)
-    # print(n_reqs)
     reqs = []
     last = 0
     for _ in range(n_reqs):
@@ -360,15 +389,21 @@ def simulate_schedule_nwc(schedule, interval, n_cpus, max_cpus, quanta_ns, accou
 
 def simulate_schedule_psjf(schedule, interval, n_cpus, max_cpus, quanta_ns, accounting):
     time = 0
+    t1 = 0
     idle_cpus = n_cpus
     queue = []
     events = []
     for request in schedule:
         heapq.heappush(events, Event('A', request.start, request))
+
     while len(events) > 0:
         event = heapq.heappop(events)
         request = event.request
         time = event.time
+        if time - t1 > 1000000000:
+            # print("Sim time = ", time/1000000000)
+            t1 = time
+            # print(event.type)
         if event.type == 'A':
             if idle_cpus > 0:  # a CPU is free
                 if request.service_time > quanta_ns:
@@ -401,6 +436,49 @@ def simulate_schedule_psjf(schedule, interval, n_cpus, max_cpus, quanta_ns, acco
             else:
                 heapq.heappush(events, Event('D', time + sj.service_time - sj.runtime, sj))
 
+def simulate_schedule_las(schedule, interval, n_cpus, max_cpus, quanta_ns, accounting):
+    time = 0
+    idle_cpus = n_cpus
+    queue = []
+    events = []
+    for request in schedule:
+        heapq.heappush(events, Event('A', request.start, request))
+    while len(events) > 0:
+        event = heapq.heappop(events)
+        request = event.request
+        time = event.time
+        if event.type == 'A':
+            if idle_cpus > 0:  # a CPU is free
+                if request.service_time > quanta_ns:
+                    heapq.heappush(events, Event('P', request.start + quanta_ns, request))
+                else:
+                    heapq.heappush(events, Event('D', request.start + request.service_time, request))
+                idle_cpus -= 1
+            else:
+                event.request.queue_start = time
+                heapq.heappush(queue, event.request)
+        elif event.type == 'D':
+            accounting.add_latency(request.service_time + request.queue_time, request.start, time)
+            if len(queue) > 0:
+                las = heapq.heappop(queue)
+                las.queue_time += (time - las.queue_start)
+                if (request.service_time - request.runtime) > quanta_ns:
+                    heapq.heappush(events, Event('P', time + quanta_ns, las))
+                else:
+                    heapq.heappush(events, Event('D', time + las.service_time - las.runtime, las)) 
+            else:
+                idle_cpus = min(idle_cpus+1, n_cpus)
+        else:   # preemption event
+            request.queue_start = time
+            heapq.heappush(queue, event.request)
+            request.runtime += quanta_ns
+            las = heapq.heappop(queue)
+            las.queue_time += (time - las.queue_start)
+            if (request.service_time - request.runtime) > quanta_ns:
+                heapq.heappush(events, Event('P', time + quanta_ns, las))
+            else:
+                heapq.heappush(events, Event('D', time + las.service_time - las.runtime, las))
+
 def simulate_schedule(schedule, sim, accounting):
     if sim.discipline == 'fifo':
         simulate_schedule_fifo(schedule, sim.interval, sim.n_cpus, sim.max_cpus, accounting)
@@ -410,6 +488,8 @@ def simulate_schedule(schedule, sim, accounting):
         simulate_schedule_ps(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns, accounting)
     elif sim.discipline == 'psjf':
         simulate_schedule_psjf(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns, accounting)
+    elif sim.discipline == 'las':
+        simulate_schedule_las(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns, accounting)
     elif sim.discipline == 'nwc':
         simulate_schedule_nwc(schedule, sim.interval, sim.n_cpus, sim.max_cpus, sim.quanta_ns, accounting)
     else:
@@ -498,6 +578,7 @@ def arguments():
             gpareto <scale> <c>
             uniform <a> <b>
             bimodal <mean1> <percent1> <mean2> <percent2>
+            trace <trace_cdf_file>
             All distribution parameters should be in microseconds
 
         Supported disciplines:
@@ -506,6 +587,7 @@ def arguments():
             ps
             psjf
             nwc (Non-work-conserving scheduler)
+            las (Least Attained Service)
                
     '''
     parser = argparse.ArgumentParser(description='Queuing System Simulation Software', usage=usg)
